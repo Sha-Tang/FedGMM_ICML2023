@@ -722,11 +722,13 @@ def get_mnist(dist_shift=False, dp=False):
     # emnist_path = os.path.join("data", "mnist", "raw_data")
     # assert os.path.isdir(emnist_path), "Download MNIST dataset!!"
 
+    global emnist_path_aug
     if dist_shift:
         emnist_path = os.path.join("data", "mnist", "raw_data")
         emnist_path_aug = os.path.join("data", "mnist_aug", "raw_data")
     else:
         emnist_path = os.path.join("data", "mnist", "raw_data")
+        emnist_path_aug = emnist_path
     assert os.path.isdir(emnist_path), "Download MNIST dataset!!"
     # Define a transform that will be applied to the images
     d_transform = T.Compose([

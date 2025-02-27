@@ -47,7 +47,8 @@ def init_clients(args_, root_path, logs_dir, save_path):
     # model = models.resnet18(pretrained=True)
     #
     # del model.fc
-    # all_data_tensor = all_data_tensor.view(-1,1,28,28)
+    # print(all_data_tensor.shape)
+    # all_data_tensor = all_data_tensor.view(-1, 3, 32, 32)
     # x = all_data_tensor
     # if all_data_tensor.shape[1] == 1:
     #     x = all_data_tensor.repeat(1, 3, 1, 1)
@@ -67,18 +68,18 @@ def init_clients(args_, root_path, logs_dir, save_path):
     # global PCA_V
     # PCA_V = V
     # print(PCA_V.size())
-    # with open(f"data/mnist9/all_data/PCA.pkl" , 'wb') as f:
+    # with open(f"data/cifar10/all_data/PCA.pkl" , 'wb') as f:
     #     pickle.dump(PCA_V, f)
-    # raise
-
-
+    # # raise
+    #
+    # emb_size = 128
     # encoder_output = encoder_output.view(encoder_output.size(0), -1)
     # pca_transformer = PCA(n_components=emb_size)
     # # Fit the PCA transformer to your data
     #
     # X_pca = pca_transformer.fit_transform(encoder_output.detach().numpy())
     # # Convert the resulting principal components to a PyTorch tensor
-    # projected = torch.from_numpy(X_pca).float().cuda()
+    # projected = torch.from_numpy(X_pca).float().cpu()
 
     print("===> Initializing clients..")
     clients_ = []
