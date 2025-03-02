@@ -39,47 +39,47 @@ def init_clients(args_, root_path, logs_dir, save_path):
         )
 
 
-    # all_data_tensor = []
-    # for cur_data in train_iterators:
-    #     all_data_tensor.append(cur_data.dataset.data)
-    # all_data_tensor = torch.cat(all_data_tensor, dim=0)
-    #
-    # model = models.resnet18(pretrained=True)
-    #
-    # del model.fc
-    # print(all_data_tensor.shape)
-    # all_data_tensor = all_data_tensor.view(-1, 3, 32, 32)
-    # x = all_data_tensor
-    # if all_data_tensor.shape[1] == 1:
-    #     x = all_data_tensor.repeat(1, 3, 1, 1)
-    # x = model.conv1(x.float())
-    # x = model.bn1(x)
-    # x = model.relu(x)
-    # x = model.maxpool(x)
-    #
-    # x = model.layer1(x)
-    # x = model.layer2(x)
-    # x = model.layer3(x)
-    # x = model.layer4(x)
-    #
-    # # Extract the feature maps produced by the encoder
-    # encoder_output = x.squeeze()
-    # U, S, V = torch.svd(encoder_output)
-    # global PCA_V
-    # PCA_V = V
-    # print(PCA_V.size())
-    # with open(f"data/cifar10/all_data/PCA.pkl" , 'wb') as f:
-    #     pickle.dump(PCA_V, f)
-    # # raise
-    #
-    # emb_size = 128
-    # encoder_output = encoder_output.view(encoder_output.size(0), -1)
-    # pca_transformer = PCA(n_components=emb_size)
-    # # Fit the PCA transformer to your data
-    #
-    # X_pca = pca_transformer.fit_transform(encoder_output.detach().numpy())
-    # # Convert the resulting principal components to a PyTorch tensor
-    # projected = torch.from_numpy(X_pca).float().cpu()
+    all_data_tensor = []
+    for cur_data in train_iterators:
+        all_data_tensor.append(cur_data.dataset.data)
+    all_data_tensor = torch.cat(all_data_tensor, dim=0)
+
+    model = models.resnet18(pretrained=True)
+
+    del model.fc
+    print(all_data_tensor.shape)
+    all_data_tensor = all_data_tensor.view(-1, 3, 32, 32)
+    x = all_data_tensor
+    if all_data_tensor.shape[1] == 1:
+        x = all_data_tensor.repeat(1, 3, 1, 1)
+    x = model.conv1(x.float())
+    x = model.bn1(x)
+    x = model.relu(x)
+    x = model.maxpool(x)
+
+    x = model.layer1(x)
+    x = model.layer2(x)
+    x = model.layer3(x)
+    x = model.layer4(x)
+
+    # Extract the feature maps produced by the encoder
+    encoder_output = x.squeeze()
+    U, S, V = torch.svd(encoder_output)
+    global PCA_V
+    PCA_V = V
+    print(PCA_V.size())
+    with open(f"data/cifar10/all_data/PCA.pkl" , 'wb') as f:
+        pickle.dump(PCA_V, f)
+    # raise
+
+    emb_size = 128
+    encoder_output = encoder_output.view(encoder_output.size(0), -1)
+    pca_transformer = PCA(n_components=emb_size)
+    # Fit the PCA transformer to your data
+
+    X_pca = pca_transformer.fit_transform(encoder_output.detach().numpy())
+    # Convert the resulting principal components to a PyTorch tensor
+    projected = torch.from_numpy(X_pca).float().cpu()
 
     print("===> Initializing clients..")
     clients_ = []
