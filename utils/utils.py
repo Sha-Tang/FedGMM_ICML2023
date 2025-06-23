@@ -497,7 +497,9 @@ def get_client(
         save_path,
         gmm_iterator_train=None,
         gmm_iterator_val=None,
-        gmm_iterator_test=None
+        gmm_iterator_test=None,
+        client_id=0,
+        args=None
 ):
     """
 
@@ -510,6 +512,8 @@ def get_client(
     :param logger:
     :param local_steps:
     :param tune_locally
+    :param client_id: client ID for DGC compression statistics
+    :param args: command line arguments containing DGC settings
 
     :return:
 
@@ -564,8 +568,10 @@ def get_client(
             test_iterator=test_iterator,
             logger=logger,
             local_steps=local_steps,
+            save_path=save_path,
+            client_id=client_id,
             tune_locally=tune_locally,
-            save_path=save_path
+            args=args
         )
     elif client_type == "normal":
         return Client(

@@ -10,6 +10,482 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import pairwise_distances
 
 from utils.torch_utils import *
+from gradient_cache import GradientCacheManager
+
+
+class AnomalyDetector:
+    """
+    客户端上传内容异常检测器
+    负责检测和处理客户端上传的delta向量中的异常值
+    """
+    
+    def __init__(self, strict_mode=True):
+        """
+        初始化异常检测器
+        
+        Args:
+            strict_mode: 是否启用严格模式（更严格的异常阈值）
+        """
+        self.strict_mode = strict_mode
+        self.client_anomaly_records = {}  # 记录每个客户端的异常次数
+        
+        # 📌 问题1解决：跳过次数限制和分布保护
+        self.max_consecutive_skips = 3  # 最多连续跳过3次
+        self.client_skip_counts = {}    # 记录连续跳过次数
+        self.client_sample_counts = {}  # 记录客户端样本数（用于分布平衡）
+        self.force_inclusion_mode = False  # 强制包含模式（保护数据分布）
+        
+    def detect_client_anomalies(self, client_id: int, delta_vector: torch.Tensor) -> dict:
+        """
+        📌 第一步：检测单个客户端上传的delta向量异常
+        
+        Args:
+            client_id: 客户端ID
+            delta_vector: 客户端上传的delta向量 (已展平)
+            
+        Returns:
+            dict: 异常检测结果
+        """
+        total_elements = delta_vector.numel()
+        
+        # 基本异常统计
+        nan_count = torch.isnan(delta_vector).sum().item()
+        inf_count = torch.isinf(delta_vector).sum().item()
+        zero_count = (delta_vector == 0.0).sum().item()
+        
+        # 计算异常比例
+        nan_ratio = nan_count / total_elements
+        inf_ratio = inf_count / total_elements  
+        zero_ratio = zero_count / total_elements
+        total_anomaly_ratio = (nan_count + inf_count) / total_elements
+        
+        # 数值统计
+        finite_mask = torch.isfinite(delta_vector)
+        if finite_mask.any():
+            finite_values = delta_vector[finite_mask]
+            value_stats = {
+                'mean': finite_values.mean().item(),
+                'std': finite_values.std().item(),
+                'max': finite_values.max().item(),
+                'min': finite_values.min().item(),
+                'abs_max': finite_values.abs().max().item()
+            }
+        else:
+            value_stats = {'mean': 0, 'std': 0, 'max': 0, 'min': 0, 'abs_max': 0}
+        
+        # 异常分类判断
+        anomaly_level = self._classify_anomaly_level(
+            nan_ratio, inf_ratio, zero_ratio, total_anomaly_ratio, value_stats
+        )
+        
+        # 📌 问题1&2解决：智能降级和跳过限制
+        should_skip = self._should_skip_client(client_id, anomaly_level, detection_result={
+            'nan_ratio': nan_ratio, 'inf_ratio': inf_ratio, 'zero_ratio': zero_ratio,
+            'total_anomaly_ratio': total_anomaly_ratio, 'value_stats': value_stats
+        })
+        
+        detection_result = {
+            'client_id': client_id,
+            'total_elements': total_elements,
+            'nan_count': nan_count,
+            'inf_count': inf_count,
+            'zero_count': zero_count,
+            'nan_ratio': nan_ratio,
+            'inf_ratio': inf_ratio,
+            'zero_ratio': zero_ratio,
+            'total_anomaly_ratio': total_anomaly_ratio,
+            'value_stats': value_stats,
+            'anomaly_level': anomaly_level,
+            'should_skip': should_skip
+        }
+        
+        # 记录异常
+        if anomaly_level != 'normal':
+            self._record_client_anomaly(client_id, anomaly_level)
+        
+        return detection_result
+    
+    def _classify_anomaly_level(self, nan_ratio, inf_ratio, zero_ratio, total_anomaly_ratio, value_stats):
+        """
+        异常分类逻辑（无需硬编码阈值，基于数据特征判断）
+        """
+        # 严重异常：大量无效值或全零
+        if total_anomaly_ratio > 0.5:  # 超过50%为NaN/Inf
+            return 'severe'
+        
+        if zero_ratio > 0.99:  # 超过99%为零（异常稀疏）
+            return 'severe'
+            
+        # 数值爆炸检测
+        if value_stats['abs_max'] > 100.0:  # 参数变化过大
+            return 'severe'
+            
+        # 中等异常：包含一定比例异常值但未达到严重程度
+        if total_anomaly_ratio > 0.1:  # 超过10%为NaN/Inf
+            return 'moderate'
+            
+        if value_stats['abs_max'] > 10.0:  # 参数变化较大
+            return 'moderate'
+            
+        # 轻微异常：少量异常值
+        if total_anomaly_ratio > 0.01:  # 超过1%为NaN/Inf
+            return 'minor'
+            
+        return 'normal'
+    
+    def _should_skip_client(self, client_id: int, anomaly_level: str, detection_result: dict) -> bool:
+        """
+        📌 问题1&2解决：智能跳过判断（考虑连续跳过次数和误判保护）
+        
+        Args:
+            client_id: 客户端ID
+            anomaly_level: 异常等级
+            detection_result: 检测结果详情
+            
+        Returns:
+            bool: 是否应该跳过该客户端
+        """
+        # 初始化跳过计数
+        if client_id not in self.client_skip_counts:
+            self.client_skip_counts[client_id] = 0
+        
+        # 📌 问题2解决：误判保护 - 大梯度但无NaN/Inf的智能降级
+        if anomaly_level == 'severe':
+            nan_inf_ratio = detection_result['total_anomaly_ratio']
+            abs_max = detection_result['value_stats']['abs_max']
+            std_val = detection_result['value_stats']['std_val']
+            
+            # 如果只是数值大但没有NaN/Inf，且标准差稳定，降级为moderate
+            if nan_inf_ratio < 0.01 and abs_max > 10.0 and std_val > 0:
+                print(f"   🔄 智能降级：客户端 {client_id} 从 severe 降级为 moderate (大梯度但无异常值)")
+                anomaly_level = 'moderate'
+        
+        # 📌 问题1解决：连续跳过次数限制
+        if anomaly_level == 'severe':
+            consecutive_skips = self.client_skip_counts[client_id]
+            
+            if consecutive_skips >= self.max_consecutive_skips:
+                print(f"   🛡️  强制包含：客户端 {client_id} 连续跳过 {consecutive_skips} 次，强制降级使用")
+                anomaly_level = 'moderate'  # 强制降级，裁剪后使用
+                self.client_skip_counts[client_id] = 0  # 重置计数
+                return False
+        
+        # 决定是否跳过
+        should_skip = (anomaly_level == 'severe')
+        
+        # 更新跳过计数
+        if should_skip:
+            self.client_skip_counts[client_id] += 1
+        else:
+            self.client_skip_counts[client_id] = 0  # 重置连续跳过计数
+        
+        return should_skip
+    
+    def _record_client_anomaly(self, client_id: int, anomaly_level: str):
+        """记录客户端异常"""
+        if client_id not in self.client_anomaly_records:
+            self.client_anomaly_records[client_id] = {
+                'severe': 0, 'moderate': 0, 'minor': 0, 'total': 0
+            }
+        
+        self.client_anomaly_records[client_id][anomaly_level] += 1
+        self.client_anomaly_records[client_id]['total'] += 1
+    
+    def clean_anomalies(self, delta_vector: torch.Tensor, detection_result: dict) -> torch.Tensor:
+        """
+        📌 第二步：清理异常值
+        
+        Args:
+            delta_vector: 原始delta向量
+            detection_result: 异常检测结果
+            
+        Returns:
+            torch.Tensor: 清理后的delta向量
+        """
+        cleaned_vector = delta_vector.clone()
+        
+        # 替换NaN和Inf为0
+        cleaned_vector[torch.isnan(cleaned_vector)] = 0.0
+        cleaned_vector[torch.isinf(cleaned_vector)] = 0.0
+        
+        # 📌 问题4解决：自适应梯度裁剪
+        if detection_result['anomaly_level'] in ['moderate', 'severe']:
+            cleaned_vector = self._adaptive_gradient_clipping(cleaned_vector, detection_result)
+        
+        return cleaned_vector
+    
+    def _adaptive_gradient_clipping(self, delta_vector: torch.Tensor, detection_result: dict) -> torch.Tensor:
+        """
+        📌 问题4解决：自适应梯度裁剪（基于统计量而非固定阈值）
+        
+        Args:
+            delta_vector: 待裁剪的delta向量
+            detection_result: 异常检测结果
+            
+        Returns:
+            torch.Tensor: 裁剪后的delta向量
+        """
+        # 获取有限值的统计信息
+        finite_mask = torch.isfinite(delta_vector)
+        if not finite_mask.any():
+            return torch.zeros_like(delta_vector)
+        
+        finite_values = delta_vector[finite_mask]
+        mean_val = finite_values.mean()
+        std_val = finite_values.std()
+        
+        # 自适应裁剪策略
+        if detection_result['anomaly_level'] == 'severe':
+            # 严重异常：较保守的裁剪 (μ ± 2σ)
+            alpha = 2.0
+        else:
+            # 中等异常：较宽松的裁剪 (μ ± 3σ)  
+            alpha = 3.0
+        
+        # 计算裁剪边界
+        if std_val > 0:
+            # 📌 基于统计量的动态边界：μ ± α·σ
+            lower_bound = mean_val - alpha * std_val
+            upper_bound = mean_val + alpha * std_val
+            
+            # 确保边界合理（避免过度保守）
+            abs_max = finite_values.abs().max()
+            if upper_bound < abs_max * 0.1:  # 如果边界过小，适当放宽
+                upper_bound = abs_max * 0.5
+                lower_bound = -abs_max * 0.5
+        else:
+            # 标准差为0，使用固定小范围
+            bound = min(1.0, finite_values.abs().max().item())
+            lower_bound = -bound
+            upper_bound = bound
+        
+        # 应用裁剪
+        clipped_vector = torch.clamp(delta_vector, lower_bound, upper_bound)
+        
+        # 统计裁剪效果
+        clipped_count = (delta_vector != clipped_vector).sum().item()
+        total_count = delta_vector.numel()
+        
+        if clipped_count > 0:
+            print(f"   🔧 自适应裁剪: [{lower_bound:.4f}, {upper_bound:.4f}], "
+                  f"裁剪 {clipped_count}/{total_count} ({clipped_count/total_count:.1%}) 个元素")
+        
+        return clipped_vector
+    
+    def detect_global_anomalies(self, aggregated_gradients: dict) -> dict:
+        """
+        📌 第三步：检测全局聚合后的异常
+        
+        Args:
+            aggregated_gradients: 聚合后的梯度字典
+            
+        Returns:
+            dict: 全局异常检测结果
+        """
+        global_anomalies = {}
+        
+        for learner_id, grad_tensor in aggregated_gradients.items():
+            # 对每个learner的聚合结果进行检测
+            anomaly_result = self.detect_client_anomalies(-1, grad_tensor)  # 使用-1表示全局
+            global_anomalies[learner_id] = anomaly_result
+        
+        return global_anomalies
+    
+    def print_anomaly_report(self, detection_result: dict, round_num: int):
+        """打印异常检测报告"""
+        client_id = detection_result['client_id']
+        level = detection_result['anomaly_level']
+        
+        if level == 'normal':
+            return
+            
+        print(f"🚨 [第{round_num}轮] 客户端 {client_id} 异常检测报告:")
+        print(f"   异常等级: {level}")
+        print(f"   NaN比例: {detection_result['nan_ratio']:.2%}")
+        print(f"   Inf比例: {detection_result['inf_ratio']:.2%}")
+        print(f"   零值比例: {detection_result['zero_ratio']:.2%}")
+        print(f"   数值范围: [{detection_result['value_stats']['min']:.6f}, {detection_result['value_stats']['max']:.6f}]")
+        print(f"   最大绝对值: {detection_result['value_stats']['abs_max']:.6f}")
+        
+        if detection_result['should_skip']:
+            print(f"   ⚠️  决定: 跳过该客户端数据")
+        else:
+            print(f"   ✅ 决定: 清理异常值后使用")
+    
+    def get_anomaly_summary(self) -> dict:
+        """获取异常统计摘要"""
+        return {
+            'total_clients_with_anomalies': len(self.client_anomaly_records),
+            'client_records': self.client_anomaly_records.copy()
+        }
+
+
+def recover_and_aggregate(client_payloads, n_learners, cache_manager=None, clients_weights=None, anomaly_detector=None, round_num=0):
+    """
+    Recover dense gradients from client payloads (both dense and compressed) and aggregate them.
+    
+    Args:
+        client_payloads: List of dictionaries returned by client.step()
+        n_learners: Number of learners in the ensemble
+        cache_manager: GradientCacheManager for handling compressed data recovery
+        clients_weights: Tensor of client weights for weighted averaging
+        anomaly_detector: AnomalyDetector for detecting and handling anomalies
+        round_num: Current training round for logging
+        
+    Returns:
+        aggregated: Dictionary mapping learner_id to aggregated gradient tensor
+    """
+    client_gradients = {m: [] for m in range(n_learners)}
+    client_indices = []  # 记录每个client的索引，用于权重对应
+    valid_client_indices = []  # 记录通过异常检测的客户端索引
+    compression_stats = {'dense_clients': 0, 'compressed_clients': 0, 'cache_usage': {}, 'skipped_clients': 0}
+    
+    for idx, payload in enumerate(client_payloads):
+        client_id = payload.get('client_id', idx)
+        client_indices.append(idx)  # 记录客户端在sampled_clients中的索引
+        
+        if payload['type'] == 'dense':
+            # Handle dense uploads (during warmup or DGC disabled)
+            compression_stats['dense_clients'] += 1
+            
+            for m in range(n_learners):
+                grad = torch.from_numpy(payload['updates'][m]).float()
+                
+                # 📌 第一步 & 第二步：异常检测和处理
+                if anomaly_detector is not None:
+                    detection_result = anomaly_detector.detect_client_anomalies(client_id, grad.flatten())
+                    anomaly_detector.print_anomaly_report(detection_result, round_num)
+                    
+                    if detection_result['should_skip']:
+                        print(f"⚠️  [第{round_num}轮] 跳过客户端 {client_id} (learner {m}) - 严重异常")
+                        compression_stats['skipped_clients'] += 1
+                        continue  # 跳过这个learner的数据
+                    
+                    # 清理异常值
+                    grad = anomaly_detector.clean_anomalies(grad.flatten(), detection_result)
+                    grad = grad.reshape(payload['updates'][m].shape)
+                
+                client_gradients[m].append(grad)
+                
+        elif payload['type'] == 'compressed':
+            # Handle compressed uploads (DGC enabled)
+            compression_stats['compressed_clients'] += 1
+            
+            client_has_valid_data = False
+            for m, data in payload['learners_data'].items():
+                learner_id = int(m)
+                
+                # Extract sparse data
+                indices = torch.tensor(data['indices'], dtype=torch.long)
+                values = torch.tensor(data['values'], dtype=torch.float32)
+                shape = data['shape']
+                
+                if cache_manager is not None:
+                    # Use cache manager to recover complete gradient
+                    full_grad = cache_manager.recover_from_compressed(
+                        learner_id, indices, values, shape
+                    )
+                    # Reshape to original shape
+                    full_grad = full_grad.reshape(shape)
+                    compression_stats['cache_usage'][learner_id] = 'used_cache'
+                else:
+                    # Fallback: basic recovery without cache (zeros for missing positions)
+                    full_grad = torch.zeros(int(np.prod(shape)), dtype=torch.float32)
+                    if len(indices) > 0:
+                        full_grad[indices] = values
+                    full_grad = full_grad.reshape(shape)
+                    compression_stats['cache_usage'][learner_id] = 'no_cache'
+                
+                # 📌 第一步 & 第二步：异常检测和处理（压缩数据）
+                if anomaly_detector is not None:
+                    detection_result = anomaly_detector.detect_client_anomalies(client_id, full_grad.flatten())
+                    anomaly_detector.print_anomaly_report(detection_result, round_num)
+                    
+                    if detection_result['should_skip']:
+                        print(f"⚠️  [第{round_num}轮] 跳过客户端 {client_id} (learner {learner_id}) - 严重异常")
+                        compression_stats['skipped_clients'] += 1
+                        continue  # 跳过这个learner的数据
+                    
+                    # 清理异常值
+                    cleaned_grad = anomaly_detector.clean_anomalies(full_grad.flatten(), detection_result)
+                    full_grad = cleaned_grad.reshape(shape)
+                    client_has_valid_data = True
+                
+                client_gradients[learner_id].append(full_grad)
+            
+            # 如果该客户端至少有一个learner的数据通过检测，记录为有效客户端
+            if client_has_valid_data:
+                valid_client_indices.append(idx)
+        
+        # 记录有效客户端（用于权重计算）
+        if payload['type'] == 'dense' or (payload['type'] == 'compressed' and client_has_valid_data):
+            valid_client_indices.append(idx)
+    
+    # Aggregate gradients for each learner with proper weighting
+    aggregated = {}
+    for m in range(n_learners):
+        if len(client_gradients[m]) > 0:
+            # ✅ 修复：使用加权平均而非简单平均（只对有效客户端）
+            if clients_weights is not None and len(clients_weights) >= len(client_gradients[m]):
+                # 获取参与本轮训练且通过异常检测的客户端权重
+                participating_weights = clients_weights[valid_client_indices[:len(client_gradients[m])]]
+                participating_weights = participating_weights / participating_weights.sum()  # 归一化权重
+                
+                # 加权聚合
+                weighted_sum = torch.zeros_like(client_gradients[m][0])
+                for i, grad in enumerate(client_gradients[m]):
+                    weighted_sum += participating_weights[i].item() * grad
+                aggregated[m] = weighted_sum
+            else:
+                # 回退到简单平均（无权重信息时）
+                aggregated[m] = torch.stack(client_gradients[m], dim=0).mean(dim=0)
+        else:
+            # No gradients received for this learner (shouldn't happen normally)
+            aggregated[m] = torch.zeros(1)  # Will need proper shape handling later
+    
+    # 📌 第三步：全局聚合后异常检测
+    if anomaly_detector is not None and len(aggregated) > 0:
+        global_anomalies = anomaly_detector.detect_global_anomalies(aggregated)
+        
+        severe_anomalies = []
+        for learner_id, global_result in global_anomalies.items():
+            if global_result['anomaly_level'] == 'severe':
+                severe_anomalies.append(learner_id)
+        
+        if len(severe_anomalies) > 0:
+            print(f"🚨 [第{round_num}轮] 全局聚合后检测到严重异常 (Learners: {severe_anomalies})")
+            print(f"   📌 问题3解决：采用温和恢复策略，而非激进清零")
+            
+            # 📌 问题3解决：温和恢复策略
+            for learner_id in severe_anomalies:
+                grad_tensor = aggregated[learner_id]
+                
+                # 分层处理：只清理异常部分，保留正常部分
+                finite_mask = torch.isfinite(grad_tensor)
+                if finite_mask.any():
+                    # 保留有限值，清理异常值
+                    cleaned_grad = grad_tensor.clone()
+                    cleaned_grad[~finite_mask] = 0.0
+                    
+                    # 如果清理后还有有效数据，使用清理版本
+                    valid_ratio = finite_mask.float().mean().item()
+                    if valid_ratio > 0.5:  # 超过50%的数据有效
+                        aggregated[learner_id] = cleaned_grad
+                        print(f"   ✅ Learner {learner_id}: 部分清理恢复 (保留{valid_ratio:.1%}有效数据)")
+                    else:
+                        # 数据损坏严重，使用零更新（相当于跳过本轮更新）
+                        aggregated[learner_id] = torch.zeros_like(grad_tensor)
+                        print(f"   ⚠️  Learner {learner_id}: 损坏严重，本轮零更新")
+                else:
+                    # 全部异常，零更新
+                    aggregated[learner_id] = torch.zeros_like(grad_tensor)
+                    print(f"   ⚠️  Learner {learner_id}: 全部异常，本轮零更新")
+    
+    print(f"📥 [服务器] 接收自客户端: {compression_stats['dense_clients']} 个稠密模型(100%) + {compression_stats['compressed_clients']} 个压缩模型")
+    if compression_stats['skipped_clients'] > 0:
+        print(f"⚠️  [异常处理] 跳过 {compression_stats['skipped_clients']} 个异常客户端数据")
+    
+    return aggregated
 
 
 class Aggregator(ABC):
@@ -132,7 +608,7 @@ class Aggregator(ABC):
 
     def update_test_clients(self):
         for client in self.test_clients:
-            for learner_id, learner in enumerate(test_clients.learners_ensemble):
+            for learner_id, learner in enumerate(client.learners_ensemble):
                 copy_model(target=learner.model, source=self.global_learners_ensemble[learner_id].model)
 
         for client in self.test_clients:
@@ -198,6 +674,17 @@ class Aggregator(ABC):
 
         if self.verbose > 0:
             print("#" * 80)
+            
+            # 📌 输出异常检测统计报告
+            if hasattr(self, 'anomaly_detector') and self.c_round % (self.log_freq * 2) == 0:
+                anomaly_summary = self.anomaly_detector.get_anomaly_summary()
+                if anomaly_summary['total_clients_with_anomalies'] > 0:
+                    print("📊 异常检测统计报告:")
+                    print(f"   发现异常的客户端数量: {anomaly_summary['total_clients_with_anomalies']}")
+                    for client_id, records in anomaly_summary['client_records'].items():
+                        print(f"   客户端 {client_id}: 总异常 {records['total']} 次 "
+                              f"(严重: {records['severe']}, 中等: {records['moderate']}, 轻微: {records['minor']})")
+                    print("#" * 80)
 
     def save_state(self, dir_path):
         """
@@ -394,20 +881,21 @@ class ACGCentralizedAggregator(Aggregator):
 
     """
 
-    def __init__(self,
-                 clients,
-                 global_learners_ensemble,
-                 log_freq,
-                 global_train_logger,
-                 global_test_logger,
-                 sampling_rate=1.,
-                 sample_with_replacement=False,
-                 test_clients=None,
-                 verbose=0,
-                 seed=None,
-                 ac_update_interval=10,
-                 *args,
-                 **kwargs):
+    def __init__(
+            self,
+            clients,
+            global_learners_ensemble,
+            log_freq,
+            global_train_logger,
+            global_test_logger,
+            sampling_rate=1.,
+            sample_with_replacement=False,
+            test_clients=None,
+            verbose=0,
+            seed=None,
+            ac_update_interval=10,
+            *args,
+            **kwargs):
 
         super().__init__(clients,
                          global_learners_ensemble,
@@ -422,6 +910,27 @@ class ACGCentralizedAggregator(Aggregator):
                          *args,
                          **kwargs)
         self.ac_update_interval = ac_update_interval
+        
+        # Initialize gradient cache manager for DGC
+        self.gradient_cache = GradientCacheManager(device=self.device)
+        print(f"Initialized GradientCacheManager on device: {self.device}")
+        
+        # 📌 初始化异常检测器
+        self.anomaly_detector = AnomalyDetector(strict_mode=True)
+        print(f"Initialized AnomalyDetector for robust DGC compression")
+    
+    def _update_gradient_cache(self):
+        """Update gradient cache with current global learner parameters"""
+        for learner_id, learner in enumerate(self.global_learners_ensemble):
+            # Get flattened parameter tensor
+            param_tensor = learner.get_param_tensor()
+            self.gradient_cache.update_cache(learner_id, param_tensor)
+        
+        if self.c_round <= 3:  # Log for first few rounds
+            cache_info = self.gradient_cache.get_cache_info()
+            print(f"Round {self.c_round}: Updated cache - {cache_info['num_cached_learners']} learners, "
+                  f"{cache_info['total_memory_mb']:.1f}MB")
+    
     def update_test_clients(self):
         for client in self.clients:
             client.learners_ensemble.gmm.update_parameter(
@@ -434,15 +943,56 @@ class ACGCentralizedAggregator(Aggregator):
             client.update_sample_weights()
             client.update_learners_weights()
     def mix(self, gmm=False, unseen=False):
+        print(f"\n🚀 [第 {self.c_round} 轮]")
+        
         self.sample_clients()
 
         if not unseen:
+            # ✅ 修复：在客户端训练前更新缓存（存储训练前的参数）
+            # 这样缓存中的参数才是客户端计算delta的基准参数
+            self._update_gradient_cache()
+            
+            # Collect client updates (either dense or compressed)
+            client_payloads = []
             for client in self.sampled_clients:
-                client.step()
+                client_update = client.step(current_round=self.c_round)
+                client_payloads.append(client_update)
 
-            # if self.c_round % self.ac_update_interval == 0:
-            # client.ac_step()
+            # Check if any client used compression
+            has_compressed_clients = any(payload.get('type') == 'compressed' for payload in client_payloads)
+            
+            if has_compressed_clients:
+                # DGC-aware aggregation path: recover sparse gradients and aggregate with cache
+                aggregated_gradients = recover_and_aggregate(
+                    client_payloads, self.n_learners, 
+                    cache_manager=self.gradient_cache,
+                    clients_weights=self.clients_weights,
+                    anomaly_detector=self.anomaly_detector,
+                    round_num=self.c_round
+                )
+                
+                # ✅ 使用异常检测系统处理后的安全数据
+                for learner_id, learner in enumerate(self.global_learners_ensemble):
+                    if learner_id in aggregated_gradients:
+                        grad_tensor = aggregated_gradients[learner_id].to(learner.device)
+                        
+                        # 应用delta更新到模型参数: new_params = old_params + delta
+                        param_idx = 0
+                        with torch.no_grad():
+                            for param in learner.model.parameters():
+                                param_size = param.numel()
+                                param_delta = grad_tensor[param_idx:param_idx + param_size].reshape(param.shape)
+                                param.data += param_delta  # 正确：累加delta
+                                param_idx += param_size
+            else:
+                # All clients used dense upload: use original FedGMM aggregation logic
+                for learner_id, learner in enumerate(self.global_learners_ensemble):
+                    learners = [client.learners_ensemble[learner_id] for client in self.clients]
+                    gammas = torch.cat([client.n_train_samples * client.learners_ensemble.learners_weights.unsqueeze(0) for client in self.clients])
+                    gammas_sum2 = gammas.sum(dim=1)  # [c, m2]
+                    average_learners(learners, learner, weights=gammas_sum2[:, learner_id])
 
+            # GMM parameter updates (unchanged)
             gammas = torch.cat(
                 [client.n_train_samples * client.learners_ensemble.learners_weights.unsqueeze(0) for client in self.clients]
             )  # [c, m1, m2]
@@ -463,9 +1013,9 @@ class ACGCentralizedAggregator(Aggregator):
 
             global_learners_weights = gammas.sum(dim=0) / gammas.sum()
 
-            for learner_id, learner in enumerate(self.global_learners_ensemble):
-                learners = [client.learners_ensemble[learner_id] for client in self.clients]
-                average_learners(learners, learner, weights=gammas_sum2[:, learner_id])
+            # for learner_id, learner in enumerate(self.global_learners_ensemble):
+            #     learners = [client.learners_ensemble[learner_id] for client in self.clients]
+            #     average_learners(learners, learner, weights=gammas_sum2[:, learner_id])
 
             # if self.c_round % self.ac_update_interval == 0:
             #     autoencoders = [client.learners_ensemble.autoencoder for client in self.clients]
@@ -504,6 +1054,13 @@ class ACGCentralizedAggregator(Aggregator):
     #         client.update_sample_weights()
     #         client.update_learners_weights()
     def update_clients(self):
+        # 简单的服务器下发模型大小打印（中文）- 只计算神经网络模型
+        total_model_bytes = sum(sum(p.numel() * 4 for p in learner.model.parameters()) 
+                               for learner in self.global_learners_ensemble)
+        total_mb = total_model_bytes / (1024 * 1024)
+        print(f"📤 [服务器] 向 {len(self.clients)} 个客户端下发模型: 每个 {total_model_bytes:,} 字节 ({total_mb:.2f} MB) - 100%模型大小")
+        
+        # 下发给每个客户端
         for client in self.clients:
             client.learners_ensemble.gmm.update_parameter(
                 mu=self.global_learners_ensemble.gmm.mu, var=self.global_learners_ensemble.gmm.var)
@@ -537,7 +1094,7 @@ class ACGCentralizedAggregator(Aggregator):
 
             for client_id, client in enumerate(clients):
 
-                train_loss, train_acc, test_loss, test_acc, train_recon, train_nll, test_recon, test_nll = client.write_logs()
+                train_loss, train_acc, test_loss, test_acc = client.write_logs()
 
                 if self.verbose > 1:
                     print("*" * 30)
@@ -548,8 +1105,6 @@ class ACGCentralizedAggregator(Aggregator):
 
                     print(f"Train Loss: {train_loss:.3f} | Train Acc: {train_acc * 100:.3f}%|", end="")
                     print(f"Test Loss: {test_loss:.3f} | Test Acc: {test_acc * 100:.3f}% |")
-                    print(f"Train Reconstruction Loss: {train_recon:.3f} | Train NLL: {train_nll:.3f}|", end="")
-                    print(f"Test Reconstruction Loss: {test_recon:.3f} | Test NLL: {test_nll:.3f} |")
 
                 global_train_loss += train_loss * client.n_train_samples
                 global_train_acc += train_acc * client.n_train_samples

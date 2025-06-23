@@ -211,6 +211,41 @@ def parse_args(args_list=None):
         default=1234
     )
 
+    # DGC 梯度压缩命令(Deep Gradient Compression) related arguments
+    parser.add_argument(
+        "--use_dgc",
+        help='if selected, Deep Gradient Compression is enabled for communication efficiency',
+        action='store_true'
+    )
+    parser.add_argument(
+        "--compress_ratio",
+        help='gradient compression ratio, e.g., 0.8 means keeping top 80%% of gradients; '
+             'only used when --use_dgc is enabled; default is 0.1 (keep top 10%%)',
+        type=float,
+        default=0.3
+    )
+    parser.add_argument(
+        "--warmup_rounds",
+        help='number of warm-up rounds without compression to ensure training stability; '
+             'only used when --use_dgc is enabled; default is 0',
+        type=int,
+        default=3
+    )
+    parser.add_argument(
+        "--early_stop_rounds",
+        help='maximum number of rounds for early stopping; '
+             'if 0, no early stopping is applied; default is 0',
+        type=int,
+        default=10
+    )
+    parser.add_argument(
+        "--stop_compress_round", 
+        help='stop compression after this round; '
+             'if -1, compression continues until the end; default is -1',
+        type=int,
+        default=-1
+    )
+
     if args_list:
         args = parser.parse_args(args_list)
     else:
