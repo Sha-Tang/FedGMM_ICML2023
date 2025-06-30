@@ -1030,6 +1030,248 @@ class ACGLearnersEnsemble(object):
     def __getitem__(self, idx):
         return self.learners[idx]
 
+    # ========================================
+    # 🔄 Communication Compression Support
+    # ========================================
+    
+    def enable_compression(self, args):
+        """
+        启用通信压缩功能
+        
+        Args:
+            args: 包含压缩配置的参数对象
+        """
+        from utils.compression import create_compressor
+        
+        self.compression_enabled = hasattr(args, 'use_dgc') and args.use_dgc
+        self.compression_args = args if self.compression_enabled else None
+        self.compressor = create_compressor(args) if self.compression_enabled else None
+        self.current_round = 0
+        
+        # 初始化压缩统计
+        self.compression_stats = {
+            'total_rounds': 0,
+            'compressed_rounds': 0,
+            'full_upload_rounds': 0,
+            'total_compression_ratio': 0.0
+        }
+        
+        if self.compression_enabled:
+            print(f"🔄 Compression enabled: Top-{args.topk_ratio:.1%} {args.topk_strategy} strategy")
+            print(f"   Warmup rounds: {args.warmup_rounds}")
+            print(f"   Force upload every: {args.force_upload_every} rounds")
+    
+    def get_flat_model_params(self) -> torch.Tensor:
+        """
+        展平所有学习器的模型参数为单个向量
+        
+        Returns:
+            flat_params: 展平的参数张量 (shape: [n_learners * model_dim])
+        """
+        all_params = []
+        for learner in self.learners:
+            learner_params = learner.get_param_tensor()
+            all_params.append(learner_params)
+        
+        return torch.cat(all_params, dim=0)
+    
+    def set_flat_model_params(self, flat_params: torch.Tensor):
+        """
+        将展平的参数重新分配给各个学习器
+        
+        Args:
+            flat_params: 展平的参数张量
+        """
+        start_idx = 0
+        for learner in self.learners:
+            param_size = learner.model_dim
+            learner_params = flat_params[start_idx:start_idx + param_size]
+            
+            # 将参数写回模型
+            param_idx = 0
+            for param in learner.model.parameters():
+                param_numel = param.numel()
+                param.data = learner_params[param_idx:param_idx + param_numel].reshape(param.shape)
+                param_idx += param_numel
+                
+            start_idx += param_size
+    
+    def get_compressed_params(self, current_round: int) -> dict:
+        """
+        获取压缩后的参数更新
+        
+        Args:
+            current_round: 当前训练轮次
+            
+        Returns:
+            压缩结果字典，包含压缩数据或完整数据
+        """
+        from utils.compression import should_compress, should_reset_residual
+        
+        # 更新轮次
+        self.current_round = current_round
+        
+        if not self.compression_enabled:
+            # 未启用压缩，返回完整参数更新
+            return {
+                'type': 'full',
+                'data': None,  # 在fit_epochs中处理
+                'compressed': False,
+                'round': current_round
+            }
+        
+        # 判断是否需要重置残差
+        if should_reset_residual(current_round, self.compression_args):
+            self.compressor.reset_residual()
+            print(f"🔄 Round {current_round}: Reset residual cache (force upload)")
+        
+        # 判断是否压缩
+        compress_this_round = should_compress(current_round, self.compression_args)
+        
+        return {
+            'type': 'compressed' if compress_this_round else 'full',
+            'data': None,  # 在fit_epochs中填充实际数据
+            'compressed': compress_this_round,
+            'round': current_round
+        }
+    
+    def apply_compression_to_updates(self, client_updates: torch.Tensor, 
+                                   compression_info: dict) -> dict:
+        """
+        对客户端更新应用压缩
+        
+        Args:
+            client_updates: 客户端参数更新
+            compression_info: 压缩配置信息
+            
+        Returns:
+            压缩结果
+        """
+        if not compression_info['compressed']:
+            # 不压缩，返回完整更新
+            self.compression_stats['full_upload_rounds'] += 1
+            return {
+                'type': 'full',
+                'data': client_updates.cpu().numpy(),
+                'compressed': False,
+                'round': compression_info['round']
+            }
+        
+        # 应用残差补偿
+        compensated_updates = self.compressor.get_residual_compensated_params(client_updates)
+        
+        # 执行压缩
+        compressed_values, indices, shapes = self.compressor.compress(compensated_updates)
+        
+        # 解压缩用于残差计算
+        decompressed_updates = self.compressor.decompress(compressed_values, indices, shapes)
+        
+        # 更新残差缓存
+        self.compressor.update_residual(compensated_updates, decompressed_updates)
+        
+        # 更新统计信息
+        self.compression_stats['compressed_rounds'] += 1
+        self.compression_stats['total_compression_ratio'] += self.compressor.get_compression_ratio()
+        
+        compression_ratio = self.compressor.get_compression_ratio()
+        print(f"🔄 Round {compression_info['round']}: Compressed to {compression_ratio:.1%} "
+              f"({self.compressor.compressed_size}/{self.compressor.original_size})")
+        
+        return {
+            'type': 'compressed',
+            'compressed_values': compressed_values.cpu().numpy(),
+            'indices': indices.cpu().numpy(),
+            'shapes': shapes.cpu().numpy(),
+            'compressed': True,
+            'round': compression_info['round'],
+            'compression_ratio': compression_ratio
+        }
+    
+    def set_compressed_params(self, compressed_data: dict):
+        """
+        设置从压缩数据恢复的参数
+        
+        Args:
+            compressed_data: 压缩数据字典
+        """
+        if compressed_data['type'] == 'full':
+            # 完整数据，无需解压缩
+            return torch.tensor(compressed_data['data'])
+        
+        elif compressed_data['type'] == 'compressed':
+            # 压缩数据，需要解压缩
+            compressed_values = torch.tensor(compressed_data['compressed_values'])
+            indices = torch.tensor(compressed_data['indices'])
+            shapes = torch.tensor(compressed_data['shapes'])
+            
+            # 解压缩
+            decompressed_params = self.compressor.decompress(compressed_values, indices, shapes)
+            return decompressed_params
+        
+        else:
+            raise ValueError(f"Unknown compressed data type: {compressed_data['type']}")
+    
+    def increment_round(self):
+        """
+        递增轮次计数器并更新统计信息
+        """
+        self.current_round += 1
+        self.compression_stats['total_rounds'] += 1
+    
+    def get_compression_stats(self) -> dict:
+        """
+        获取压缩统计信息
+        
+        Returns:
+            压缩统计字典
+        """
+        if not self.compression_enabled:
+            return {'compression_enabled': False}
+        
+        stats = self.compression_stats.copy()
+        stats['compression_enabled'] = True
+        
+        if stats['compressed_rounds'] > 0:
+            stats['avg_compression_ratio'] = stats['total_compression_ratio'] / stats['compressed_rounds']
+        else:
+            stats['avg_compression_ratio'] = 1.0
+            
+        if self.compressor:
+            stats.update(self.compressor.get_stats())
+            
+        return stats
+    
+    def fit_epochs_with_compression(self, iterator, n_epochs, weights=None, current_round=None):
+        """
+        带压缩功能的训练方法
+        
+        Args:
+            iterator: 数据迭代器
+            n_epochs: 训练轮数
+            weights: 样本权重
+            current_round: 当前轮次
+            
+        Returns:
+            压缩后的客户端更新或压缩信息字典
+        """
+        # 执行标准训练
+        client_updates = self.fit_epochs(iterator, n_epochs, weights)
+        
+        # 如果未启用压缩或未提供轮次信息，返回原始更新
+        if not self.compression_enabled or current_round is None:
+            return client_updates
+        
+        # 获取压缩配置
+        compression_info = self.get_compressed_params(current_round)
+        
+        # 转换为张量进行压缩处理
+        client_updates_tensor = torch.tensor(client_updates)
+        
+        # 应用压缩
+        compressed_result = self.apply_compression_to_updates(client_updates_tensor, compression_info)
+        
+        return compressed_result
+
 
 class RepDataset(Dataset):
     """
