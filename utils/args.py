@@ -20,7 +20,7 @@ def args_to_string(args):
     if args.locally_tune_clients:
         args_string += "_adapt"
     
-    # Add communication compression info to experiment path
+    # 🔄 Add communication compression info to experiment path
     if hasattr(args, 'use_dgc') and args.use_dgc:
         dgc_suffix = f"_dgc_topk{args.topk_ratio:.3f}_{args.topk_strategy}"
         if args.force_upload_every != 10:  # Only add if different from default
@@ -214,7 +214,7 @@ def parse_args(args_list=None):
         default=argparse.SUPPRESS
     )
     # ========================================
-    # Communication Compression Parameters
+    # 🔄 Communication Compression Parameters
     # ========================================
     parser.add_argument(
         "--use_dgc",

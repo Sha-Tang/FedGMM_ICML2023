@@ -67,7 +67,7 @@ def demonstrate_compression_usage():
         args.warmup_rounds = 2
         args.force_upload_every = 5
     
-    print(f"[COMPRESSION] 压缩配置:")
+    print(f"🔄 压缩配置:")
     print(f"   启用压缩: {getattr(args, 'use_dgc', False)}")
     print(f"   Top-K比例: {getattr(args, 'topk_ratio', 'N/A')}")
     print(f"   压缩策略: {getattr(args, 'topk_strategy', 'N/A')}")
@@ -132,7 +132,7 @@ def print_compression_usage_examples():
 
 def main():
     """主函数"""
-    print("[TEST] FedGMM 通信压缩功能测试")
+    print("🔄 FedGMM 通信压缩功能测试")
     print("=" * 50)
     
     # 基础功能测试

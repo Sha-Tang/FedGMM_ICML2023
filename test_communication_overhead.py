@@ -185,7 +185,7 @@ def demo_practical_example():
 
 def main():
     """主函数"""
-    print("[DEMO] FedGMM 通信开销指标演示")
+    print("🔄 FedGMM 通信开销指标演示")
     print("=" * 60)
     
     # 基础计算演示
