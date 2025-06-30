@@ -132,7 +132,7 @@ class Aggregator(ABC):
 
     def update_test_clients(self):
         for client in self.test_clients:
-            for learner_id, learner in enumerate(test_clients.learners_ensemble):
+            for learner_id, learner in enumerate(client.learners_ensemble):
                 copy_model(target=learner.model, source=self.global_learners_ensemble[learner_id].model)
 
         for client in self.test_clients:

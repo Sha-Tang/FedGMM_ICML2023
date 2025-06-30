@@ -74,18 +74,18 @@ Specify the name of the dataset (experiment), the used method, and configure all
 hyper-parameters (see all hyper-parameters values in the appendix of the paper)
 
 ```train
-python3  python run_experiment.py cifar10 FedGMM `
+python run_experiment.py cifar10 FedGMM `
     --n_learners 3 `
-    --n_gmm 3
+    --n_gmm 3 `
     --n_rounds 200 `
     --bz 128 `
     --lr 0.01 `
     --lr_scheduler multi_step `
     --log_freq 5 `
-    --device cuda `
+    --device cpu `
     --optimizer sgd `
     --seed 1234 `
-    --logs_root ./logs `
+    --logs_dir ./logs `
     --verbose 1
 ```
 
