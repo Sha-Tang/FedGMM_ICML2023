@@ -121,7 +121,8 @@ def init_clients(args_, root_path, logs_dir, save_path):
             logger=logger,
             local_steps=args_.local_steps,
             save_path=save_path_,
-            tune_locally=args_.locally_tune_clients
+            tune_locally=args_.locally_tune_clients,
+            compression_args=args_
         )
 
         clients_.append(client)

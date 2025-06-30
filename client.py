@@ -193,10 +193,20 @@ class MixtureClient(Client):
 
 class ACGMixtureClient(Client):
     def __init__(self, learners_ensemble, train_iterator, val_iterator, test_iterator, logger, local_steps, save_path,
-                 tune_locally=False):
+                 tune_locally=False, compression_args=None):
         super().__init__(learners_ensemble, train_iterator, val_iterator, test_iterator, logger, local_steps, save_path,
                          tune_locally)
         self.learners_ensemble.initialize_gmm(iterator=train_iterator)
+        
+        # 🔄 Initialize compression support
+        self.compression_args = compression_args
+        if hasattr(self.learners_ensemble, 'enable_compression'):
+            self.learners_ensemble.enable_compression(compression_args)
+            if compression_args and getattr(compression_args, 'use_dgc', False):
+                print(f"🔄 Client compression enabled: Top-{compression_args.topk_ratio:.1%}")
+        
+        # Track communication rounds for compression decision
+        self.communication_round = 0
 
     def update_sample_weights(self):
         self.samples_weights = self.learners_ensemble.calc_samples_weights(self.val_iterator)
@@ -208,6 +218,7 @@ class ACGMixtureClient(Client):
     """
     def step(self, single_batch_flag=False, n_iter=1, *args, **kwargs):
         self.counter += 1
+        self.communication_round += 1
 
         # self.learners_ensemble.initialize_gmm(iterator=self.train_iterator)
         """
@@ -233,10 +244,13 @@ class ACGMixtureClient(Client):
                     weights=sum_samples_weights
                 )
 
+        # 🔄 Apply communication compression before upload
+        compressed_updates = self._apply_compression(client_updates, "classifier")
+        
         self.learners_ensemble.free_gradients()
         # self.clear_models()
 
-        return client_updates
+        return compressed_updates
 
     def unseen_step(self, single_batch_flag=False, n_iter=1, *args, **kwargs):
         self.counter += 1
@@ -299,7 +313,10 @@ class ACGMixtureClient(Client):
 
         self.learners_ensemble.unfreeze_classifier()
 
-        return ac_client_update
+        # 🔄 Apply communication compression for autoencoder updates
+        compressed_ac_update = self._apply_compression(ac_client_update, "autoencoder")
+        
+        return compressed_ac_update
 
     def write_logs(self):
         if self.tune_locally:
@@ -330,6 +347,153 @@ class ACGMixtureClient(Client):
         self.logger.add_scalar("Test/NLL", test_nll, self.counter)
 
         return train_loss, train_acc, test_loss, test_acc, train_recon, train_nll, test_recon, test_nll
+
+    # ========================================
+    # 🔄 Communication Compression Methods
+    # ========================================
+    
+    def _apply_compression(self, client_updates, update_type="classifier"):
+        """
+        Apply communication compression to client updates before upload
+        
+        Args:
+            client_updates: The parameter updates to be uploaded
+            update_type: Type of update ("classifier" or "autoencoder")
+            
+        Returns:
+            Compressed updates or original updates if compression disabled
+        """
+        # Check if compression is enabled
+        if not self.compression_args or not getattr(self.compression_args, 'use_dgc', False):
+            return client_updates
+        
+        # Check if learners_ensemble supports compression
+        if not hasattr(self.learners_ensemble, 'fit_epochs_with_compression'):
+            return client_updates
+        
+        # Use fit_epochs_with_compression for classifier updates
+        if update_type == "classifier" and hasattr(self.learners_ensemble, 'apply_compression_to_updates'):
+            try:
+                # Convert to tensor for compression processing
+                import torch
+                client_updates_tensor = torch.tensor(client_updates) if not isinstance(client_updates, torch.Tensor) else client_updates
+                
+                # Get compression configuration
+                compression_info = self.learners_ensemble.get_compressed_params(self.communication_round)
+                
+                # Apply compression
+                compressed_result = self.learners_ensemble.apply_compression_to_updates(
+                    client_updates_tensor, compression_info
+                )
+                
+                # Log compression statistics
+                self._log_compression_stats(compressed_result, update_type)
+                
+                return compressed_result
+                
+            except Exception as e:
+                print(f"⚠️  Compression failed for {update_type}: {e}")
+                return client_updates
+        
+        # For autoencoder updates or when compression not supported, apply simple compression
+        elif update_type == "autoencoder":
+            return self._apply_simple_compression(client_updates, update_type)
+        
+        return client_updates
+    
+    def _apply_simple_compression(self, updates, update_type):
+        """
+        Apply simple compression for non-ensemble updates (like autoencoder)
+        
+        Args:
+            updates: Parameter updates (numpy array)
+            update_type: Type of update
+            
+        Returns:
+            Compressed or original updates
+        """
+        from utils.compression import should_compress, CommunicationCompressor
+        
+        # Check if we should compress this round
+        if not should_compress(self.communication_round, self.compression_args):
+            return updates
+        
+        try:
+            import torch
+            
+            # Create a simple compressor
+            compressor = CommunicationCompressor(
+                topk_ratio=self.compression_args.topk_ratio,
+                strategy=self.compression_args.topk_strategy
+            )
+            
+            # Convert to tensor and compress
+            updates_tensor = torch.tensor(updates) if not isinstance(updates, torch.Tensor) else updates
+            compressed_values, indices, shapes = compressor.compress(updates_tensor)
+            
+            # Create compressed result dictionary
+            compressed_result = {
+                'type': 'compressed',
+                'compressed_values': compressed_values.cpu().numpy(),
+                'indices': indices.cpu().numpy(),
+                'shapes': shapes.cpu().numpy(),
+                'compressed': True,
+                'round': self.communication_round,
+                'compression_ratio': compressor.get_compression_ratio(),
+                'update_type': update_type
+            }
+            
+            # Log compression
+            self._log_compression_stats(compressed_result, update_type)
+            
+            return compressed_result
+            
+        except Exception as e:
+            print(f"⚠️  Simple compression failed for {update_type}: {e}")
+            return updates
+    
+    def _log_compression_stats(self, compressed_result, update_type):
+        """
+        Log compression statistics to TensorBoard
+        
+        Args:
+            compressed_result: Compression result dictionary
+            update_type: Type of update being compressed
+        """
+        if not isinstance(compressed_result, dict) or not compressed_result.get('compressed', False):
+            return
+        
+        try:
+            compression_ratio = compressed_result.get('compression_ratio', 1.0)
+            round_num = compressed_result.get('round', self.communication_round)
+            
+            # Log to TensorBoard
+            self.logger.add_scalar(f"Compression/{update_type}_ratio", compression_ratio, round_num)
+            self.logger.add_scalar("Compression/ratio", compression_ratio, round_num)
+            
+            # Log communication savings
+            communication_savings = (1.0 - compression_ratio) * 100
+            self.logger.add_scalar(f"Compression/{update_type}_savings_pct", communication_savings, round_num)
+            self.logger.add_scalar("Compression/savings_pct", communication_savings, round_num)
+            
+            # Print compression info
+            print(f"📊 Round {round_num} [{update_type}]: Compressed to {compression_ratio:.1%} "
+                  f"(saved {communication_savings:.1f}%)")
+                  
+        except Exception as e:
+            print(f"⚠️  Logging compression stats failed: {e}")
+    
+    def get_compression_stats(self):
+        """
+        Get overall compression statistics
+        
+        Returns:
+            Compression statistics dictionary
+        """
+        if hasattr(self.learners_ensemble, 'get_compression_stats'):
+            return self.learners_ensemble.get_compression_stats()
+        else:
+            return {'compression_enabled': False}
 
 
 class AgnosticFLClient(Client):

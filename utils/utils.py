@@ -497,7 +497,8 @@ def get_client(
         save_path,
         gmm_iterator_train=None,
         gmm_iterator_val=None,
-        gmm_iterator_test=None
+        gmm_iterator_test=None,
+        compression_args=None
 ):
     """
 
@@ -565,7 +566,8 @@ def get_client(
             logger=logger,
             local_steps=local_steps,
             tune_locally=tune_locally,
-            save_path=save_path
+            save_path=save_path,
+            compression_args=compression_args
         )
     elif client_type == "normal":
         return Client(
