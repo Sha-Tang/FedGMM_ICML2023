@@ -207,6 +207,12 @@ class ACGMixtureClient(Client):
         
         # Track communication rounds for compression decision
         self.communication_round = 0
+        
+        # 📊 Model parameter tracking (pure parameter counts, no compression overhead)
+        self.total_communication_cost = 0.0  # 累计模型参数传输量
+        self.total_original_params = 0.0     # 累计原始模型参数量
+        self.total_uploaded_params = 0.0     # 累计压缩后模型参数量 (仅参数值，不含索引/元数据)
+        self.round_communication_history = []  # 每轮模型参数传输历史
 
     def update_sample_weights(self):
         self.samples_weights = self.learners_ensemble.calc_samples_weights(self.val_iterator)
@@ -346,6 +352,27 @@ class ACGMixtureClient(Client):
         self.logger.add_scalar("Test/Recon_Loss", test_recon, self.counter)
         self.logger.add_scalar("Test/NLL", test_nll, self.counter)
 
+        # 📊 Log communication overhead summary (only light lines in TensorBoard)
+        comm_summary = self.get_communication_summary()
+        if 'error' not in comm_summary:
+            # 📈 Core metrics
+            total_original = comm_summary.get('total_original_params', 0)
+            total_uploaded = comm_summary.get('total_uploaded_params', 0)
+            total_savings = max(0, comm_summary.get('total_savings', 0))
+            savings_ratio = max(0.0, min(1.0, comm_summary.get('savings_ratio', 0.0)))
+            
+            # 📊 Compression ratio (percentage of original data transmitted)
+            upload_ratio = total_uploaded / max(total_original, 1) if total_original > 0 else 1.0
+            upload_ratio = max(0.0, min(1.0, upload_ratio))
+            
+            # 📊 TensorBoard logging (only summary, no duplicates)
+            self.logger.add_scalar("Communication/total_original_params", total_original, self.counter)
+            self.logger.add_scalar("Communication/total_uploaded_params", total_uploaded, self.counter) 
+            self.logger.add_scalar("Communication/total_savings", total_savings, self.counter)
+            self.logger.add_scalar("Communication/savings_ratio", savings_ratio, self.counter)
+            self.logger.add_scalar("Communication/overall_compression_ratio", upload_ratio, self.counter)
+            self.logger.add_scalar("Communication/total_rounds", comm_summary['total_rounds'], self.counter)
+
         return train_loss, train_acc, test_loss, test_acc, train_recon, train_nll, test_recon, test_nll
 
     # ========================================
@@ -363,12 +390,18 @@ class ACGMixtureClient(Client):
         Returns:
             Compressed updates or original updates if compression disabled
         """
+        # 📊 Calculate original parameter size for communication tracking
+        original_size = self._calculate_param_size(client_updates)
+        
         # Check if compression is enabled
         if not self.compression_args or not getattr(self.compression_args, 'use_dgc', False):
+            # No compression - upload full parameters
+            self._update_communication_stats(original_size, original_size, 1.0, update_type)
             return client_updates
         
         # Check if learners_ensemble supports compression
         if not hasattr(self.learners_ensemble, 'fit_epochs_with_compression'):
+            self._update_communication_stats(original_size, original_size, 1.0, update_type)
             return client_updates
         
         # Use fit_epochs_with_compression for classifier updates
@@ -386,6 +419,11 @@ class ACGMixtureClient(Client):
                     client_updates_tensor, compression_info
                 )
                 
+                # 📊 Calculate compressed size and update stats
+                compressed_size = self._calculate_compressed_size(compressed_result, original_size)
+                compression_ratio = compressed_result.get('compression_ratio', 1.0) if isinstance(compressed_result, dict) else 1.0
+                self._update_communication_stats(original_size, compressed_size, compression_ratio, update_type)
+                
                 # Log compression statistics
                 self._log_compression_stats(compressed_result, update_type)
                 
@@ -393,21 +431,25 @@ class ACGMixtureClient(Client):
                 
             except Exception as e:
                 print(f"⚠️  Compression failed for {update_type}: {e}")
+                self._update_communication_stats(original_size, original_size, 1.0, update_type)
                 return client_updates
         
         # For autoencoder updates or when compression not supported, apply simple compression
         elif update_type == "autoencoder":
-            return self._apply_simple_compression(client_updates, update_type)
+            return self._apply_simple_compression(client_updates, update_type, original_size)
         
+        # Fallback: no compression
+        self._update_communication_stats(original_size, original_size, 1.0, update_type)
         return client_updates
     
-    def _apply_simple_compression(self, updates, update_type):
+    def _apply_simple_compression(self, updates, update_type, original_size):
         """
         Apply simple compression for non-ensemble updates (like autoencoder)
         
         Args:
             updates: Parameter updates (numpy array)
             update_type: Type of update
+            original_size: Original parameter size
             
         Returns:
             Compressed or original updates
@@ -416,6 +458,7 @@ class ACGMixtureClient(Client):
         
         # Check if we should compress this round
         if not should_compress(self.communication_round, self.compression_args):
+            self._update_communication_stats(original_size, original_size, 1.0, update_type)
             return updates
         
         try:
@@ -443,6 +486,10 @@ class ACGMixtureClient(Client):
                 'update_type': update_type
             }
             
+            # 📊 Update communication stats
+            compressed_size = self._calculate_compressed_size(compressed_result, original_size)
+            self._update_communication_stats(original_size, compressed_size, compressor.get_compression_ratio(), update_type)
+            
             # Log compression
             self._log_compression_stats(compressed_result, update_type)
             
@@ -450,6 +497,7 @@ class ACGMixtureClient(Client):
             
         except Exception as e:
             print(f"⚠️  Simple compression failed for {update_type}: {e}")
+            self._update_communication_stats(original_size, original_size, 1.0, update_type)
             return updates
     
     def _log_compression_stats(self, compressed_result, update_type):
@@ -494,6 +542,177 @@ class ACGMixtureClient(Client):
             return self.learners_ensemble.get_compression_stats()
         else:
             return {'compression_enabled': False}
+    
+    # ========================================
+    # 📊 Communication Overhead Tracking Methods
+    # ========================================
+    
+    def _calculate_param_size(self, params):
+        """
+        Calculate the size of parameters (number of elements)
+        
+        Args:
+            params: Parameter updates (numpy array, torch tensor, or other)
+            
+        Returns:
+            int: Number of parameters
+        """
+        try:
+            import torch
+            import numpy as np
+            
+            if isinstance(params, torch.Tensor):
+                return params.numel()
+            elif isinstance(params, np.ndarray):
+                return params.size
+            elif isinstance(params, (list, tuple)):
+                return sum(self._calculate_param_size(p) for p in params)
+            elif hasattr(params, 'shape'):
+                return np.prod(params.shape)
+            else:
+                # Fallback: try to convert to numpy and get size
+                return np.array(params).size
+        except Exception as e:
+            print(f"⚠️  Error calculating parameter size: {e}")
+            return 0
+    
+    def _calculate_compressed_size(self, compressed_result, original_size):
+        """
+        Calculate the actual model parameter size after compression (excluding indices and metadata)
+        
+        Args:
+            compressed_result: Compression result dictionary or original data
+            original_size: Original parameter size
+            
+        Returns:
+            float: Actual compressed parameter size (only model parameters)
+        """
+        try:
+            if isinstance(compressed_result, dict) and compressed_result.get('compressed', False):
+                # For compressed data: only count compressed parameter values (not indices/metadata)
+                compressed_values_size = self._calculate_param_size(compressed_result.get('compressed_values', []))
+                
+                # Only return the actual compressed parameter count
+                return compressed_values_size
+            else:
+                # Uncompressed data - return original parameter size
+                return original_size
+        except Exception as e:
+            print(f"⚠️  Error calculating compressed size: {e}")
+            return original_size
+    
+    def _update_communication_stats(self, original_size, actual_size, compression_ratio, update_type):
+        """
+        Update cumulative model parameter statistics (excludes compression overhead)
+        
+        Args:
+            original_size: Original model parameter count
+            actual_size: Compressed model parameter count (only parameter values, no indices/metadata)
+            compression_ratio: Compression ratio (0-1)
+            update_type: Type of update ("classifier" or "autoencoder")
+        """
+        try:
+            # Validate input sizes (ensure non-negative)
+            original_size = max(0, original_size)
+            actual_size = max(0, actual_size)
+            compression_ratio = max(0.0, min(1.0, compression_ratio))
+            
+            # Update cumulative statistics
+            self.total_original_params += original_size
+            self.total_uploaded_params += actual_size
+            self.total_communication_cost += actual_size
+            
+            # Ensure cumulative values are non-negative
+            self.total_original_params = max(0, self.total_original_params)
+            self.total_uploaded_params = max(0, self.total_uploaded_params) 
+            self.total_communication_cost = max(0, self.total_communication_cost)
+            
+            # Record this round's communication
+            round_data = {
+                'round': self.communication_round,
+                'original_size': original_size,
+                'uploaded_size': actual_size,
+                'compression_ratio': compression_ratio,
+                'update_type': update_type
+            }
+            self.round_communication_history.append(round_data)
+            
+            # Log to TensorBoard
+            self._log_communication_overhead(original_size, actual_size, compression_ratio, update_type)
+            
+        except Exception as e:
+            print(f"⚠️  Error updating communication stats: {e}")
+            print(f"   original_size: {original_size}, actual_size: {actual_size}, ratio: {compression_ratio}")
+    
+    def _log_communication_overhead(self, original_size, actual_size, compression_ratio, update_type):
+        """
+        Log communication overhead metrics to TensorBoard
+        
+        Args:
+            original_size: Original parameter size  
+            actual_size: Compressed parameter size (only model parameters, no indices/metadata)
+            compression_ratio: Compression ratio
+            update_type: Type of update
+        """
+        try:
+            round_num = self.communication_round
+            
+            # 📊 Removed real-time TensorBoard logging to show only summary (light line)
+            # Only calculate values for internal tracking and console output
+            
+            # 💰 Savings metrics calculation (no real-time logging)
+            total_savings = max(0, self.total_original_params - self.total_uploaded_params)
+            savings_ratio = total_savings / max(self.total_original_params, 1) if self.total_original_params > 0 else 0.0
+            # Ensure savings_ratio is between 0 and 1
+            savings_ratio = max(0.0, min(1.0, savings_ratio))
+            
+            # 📊 Efficiency metrics (removed real-time logging, only summary in write_logs)
+            overall_compression_ratio = self.total_uploaded_params / max(self.total_original_params, 1)
+            # Removed: self.logger.add_scalar("Communication/overall_compression_ratio", overall_compression_ratio, round_num)
+            
+            # Print summary for important rounds (pure parameter counts)
+            if round_num % 5 == 0 or round_num <= 3:
+                current_round_savings = max(0, original_size - actual_size)
+                current_round_savings_pct = current_round_savings / max(original_size, 1) * 100
+                
+                print(f"📊 Round {round_num} [{update_type}] Model Parameter Summary:")
+                print(f"   Original params: {original_size:,} → Compressed params: {actual_size:,} ({actual_size/max(original_size,1):.1%})")
+                print(f"   Current round savings: {current_round_savings:,.0f} params ({current_round_savings_pct:.1f}%)")
+                print(f"   Cumulative params: {self.total_uploaded_params:,.0f} / {self.total_original_params:,.0f} ({overall_compression_ratio:.1%})")
+                print(f"   Total param savings: {total_savings:,.0f} ({savings_ratio:.1%})")
+                print(f"   Note: Counts only model parameters, excludes compression indices/metadata")
+                
+        except Exception as e:
+            print(f"⚠️  Error logging communication overhead: {e}")
+    
+    def get_communication_summary(self):
+        """
+        Get a summary of model parameter transmission statistics (pure parameter counts)
+        
+        Returns:
+            dict: Model parameter statistics summary (excludes compression indices/metadata)
+        """
+        try:
+            overall_ratio = self.total_uploaded_params / max(self.total_original_params, 1) if self.total_original_params > 0 else 0.0
+            total_savings = max(0, self.total_original_params - self.total_uploaded_params)
+            savings_ratio = total_savings / max(self.total_original_params, 1) if self.total_original_params > 0 else 0.0
+            # Ensure all ratios are within valid range [0, 1]
+            overall_ratio = max(0.0, min(1.0, overall_ratio))
+            savings_ratio = max(0.0, min(1.0, savings_ratio))
+            
+            return {
+                'total_rounds': len(self.round_communication_history),
+                'total_original_params': self.total_original_params,
+                'total_uploaded_params': self.total_uploaded_params,
+                'total_communication_cost': self.total_communication_cost,
+                'overall_compression_ratio': overall_ratio,
+                'total_savings': total_savings,
+                'savings_ratio': savings_ratio,
+                'average_round_savings': savings_ratio / max(len(self.round_communication_history), 1)
+            }
+        except Exception as e:
+            print(f"⚠️  Error getting communication summary: {e}")
+            return {'error': str(e)}
 
 
 class AgnosticFLClient(Client):
