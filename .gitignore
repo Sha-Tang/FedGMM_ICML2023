@@ -38,3 +38,4 @@ utils/__pycache__/metrics.cpython-310.pyc
 utils/__pycache__/optim.cpython-310.pyc
 utils/__pycache__/torch_utils.cpython-310.pyc
 utils/__pycache__/utils.cpython-310.pyc
+run.log
