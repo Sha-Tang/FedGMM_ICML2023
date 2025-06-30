@@ -1031,7 +1031,7 @@ class ACGLearnersEnsemble(object):
         return self.learners[idx]
 
     # ========================================
-    # 🔄 Communication Compression Support
+    # Communication Compression Support
     # ========================================
     
     def enable_compression(self, args):
@@ -1057,7 +1057,7 @@ class ACGLearnersEnsemble(object):
         }
         
         if self.compression_enabled:
-            print(f"🔄 Compression enabled: Top-{args.topk_ratio:.1%} {args.topk_strategy} strategy")
+            print(f"[COMPRESSION] Compression enabled: Top-{args.topk_ratio:.1%} {args.topk_strategy} strategy")
             print(f"   Warmup rounds: {args.warmup_rounds}")
             print(f"   Force upload every: {args.force_upload_every} rounds")
     
@@ -1123,7 +1123,7 @@ class ACGLearnersEnsemble(object):
         # 判断是否需要重置残差
         if should_reset_residual(current_round, self.compression_args):
             self.compressor.reset_residual()
-            print(f"🔄 Round {current_round}: Reset residual cache (force upload)")
+            print(f"[COMPRESSION] Round {current_round}: Reset residual cache (force upload)")
         
         # 判断是否压缩
         compress_this_round = should_compress(current_round, self.compression_args)
@@ -1174,7 +1174,7 @@ class ACGLearnersEnsemble(object):
         self.compression_stats['total_compression_ratio'] += self.compressor.get_compression_ratio()
         
         compression_ratio = self.compressor.get_compression_ratio()
-        print(f"🔄 Round {compression_info['round']}: Compressed to {compression_ratio:.1%} "
+        print(f"[COMPRESSION] Round {compression_info['round']}: Compressed to {compression_ratio:.1%} "
               f"({self.compressor.compressed_size}/{self.compressor.original_size})")
         
         return {

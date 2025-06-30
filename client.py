@@ -198,12 +198,12 @@ class ACGMixtureClient(Client):
                          tune_locally)
         self.learners_ensemble.initialize_gmm(iterator=train_iterator)
         
-        # 🔄 Initialize compression support
+        # Initialize compression support
         self.compression_args = compression_args
         if hasattr(self.learners_ensemble, 'enable_compression'):
             self.learners_ensemble.enable_compression(compression_args)
             if compression_args and getattr(compression_args, 'use_dgc', False):
-                print(f"🔄 Client compression enabled: Top-{compression_args.topk_ratio:.1%}")
+                print(f"[CLIENT] Compression enabled: Top-{compression_args.topk_ratio:.1%}")
         
         # Track communication rounds for compression decision
         self.communication_round = 0
@@ -250,7 +250,7 @@ class ACGMixtureClient(Client):
                     weights=sum_samples_weights
                 )
 
-        # 🔄 Apply communication compression before upload
+        # Apply communication compression before upload
         compressed_updates = self._apply_compression(client_updates, "classifier")
         
         self.learners_ensemble.free_gradients()
@@ -319,7 +319,7 @@ class ACGMixtureClient(Client):
 
         self.learners_ensemble.unfreeze_classifier()
 
-        # 🔄 Apply communication compression for autoencoder updates
+        # Apply communication compression for autoencoder updates
         compressed_ac_update = self._apply_compression(ac_client_update, "autoencoder")
         
         return compressed_ac_update
@@ -376,7 +376,7 @@ class ACGMixtureClient(Client):
         return train_loss, train_acc, test_loss, test_acc, train_recon, train_nll, test_recon, test_nll
 
     # ========================================
-    # 🔄 Communication Compression Methods
+    # Communication Compression Methods
     # ========================================
     
     def _apply_compression(self, client_updates, update_type="classifier"):
