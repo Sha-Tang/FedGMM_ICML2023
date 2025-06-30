@@ -19,6 +19,15 @@ def args_to_string(args):
 
     if args.locally_tune_clients:
         args_string += "_adapt"
+    
+    # 🔄 Add communication compression info to experiment path
+    if hasattr(args, 'use_dgc') and args.use_dgc:
+        dgc_suffix = f"_dgc_topk{args.topk_ratio:.3f}_{args.topk_strategy}"
+        if args.force_upload_every != 10:  # Only add if different from default
+            dgc_suffix += f"_force{args.force_upload_every}"
+        if args.warmup_rounds != 5:  # Only add if different from default
+            dgc_suffix += f"_warmup{args.warmup_rounds}"
+        args_string += dgc_suffix
 
     return args_string
 
@@ -204,6 +213,43 @@ def parse_args(args_list=None):
         help='directory to save checkpoints once the training is over; if not specified checkpoints are not saved',
         default=argparse.SUPPRESS
     )
+    # ========================================
+    # 🔄 Communication Compression Parameters
+    # ========================================
+    parser.add_argument(
+        "--use_dgc",
+        help='if chosen, enable communication compression using Deep Gradient Compression techniques;',
+        action='store_true'
+    )
+    parser.add_argument(
+        "--topk_ratio",
+        help='proportion of parameters to keep in Top-K compression; only used when --use_dgc is enabled; default is 0.01',
+        type=float,
+        default=0.01
+    )
+    parser.add_argument(
+        "--force_upload_every",
+        help='force full parameter upload every N rounds to prevent model drift; only used when --use_dgc is enabled; default is 10',
+        type=int,
+        default=10
+    )
+    parser.add_argument(
+        "--warmup_rounds",
+        help='number of initial rounds to use full upload before enabling compression; only used when --use_dgc is enabled; default is 5',
+        type=int,
+        default=5
+    )
+    parser.add_argument(
+        "--topk_strategy",
+        help='strategy for Top-K parameter selection;'
+             ' "magnitude": select by absolute value |Δθ|;'
+             ' "relative": select by relative change |Δθ/θ|;'
+             ' only used when --use_dgc is enabled; default is "magnitude"',
+        type=str,
+        choices=['magnitude', 'relative'],
+        default='magnitude'
+    )
+    
     parser.add_argument(
         "--seed",
         help='random seed',
