@@ -310,8 +310,11 @@ class resnet_pca(nn.Module):
             elif name == 'mnist9':
                 with open("data/mnist9/all_data/PCA.pkl", 'rb') as f:
                     self.PCA_V = pickle.load(f)
+            elif name == 'mnist':
+                with open("data/mnist/all_data/PCA.pkl", 'rb') as f:
+                    self.PCA_V = pickle.load(f)
             else:
-                raise
+                raise ValueError(f"Unknown dataset name: {name}")
         else:
             if name == 'emnist':
                 with open("data/emnist/all_data/PCA_no_t.pkl", 'rb') as f:
@@ -325,8 +328,11 @@ class resnet_pca(nn.Module):
             elif name == 'cifar100':
                 with open("data/cifar100/all_data/PCA_no_t.pkl", 'rb') as f:
                     self.PCA_V = pickle.load(f)
+            elif name == 'mnist':
+                with open("data/mnist/all_data/PCA.pkl", 'rb') as f:
+                    self.PCA_V = pickle.load(f)
             else:
-                raise
+                raise ValueError(f"Unknown dataset name: {name}")
         self.PCA_V = self.PCA_V[:,:embedding_size]
     def encode(self, x):
 

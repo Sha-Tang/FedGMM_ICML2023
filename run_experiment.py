@@ -57,8 +57,8 @@ def init_clients(args_, root_path, logs_dir, save_path):
     print(all_data_tensor.shape)
     
     # Handle different dataset formats
-    if args_.experiment == "femnist":
-        # FEMNIST: 28x28 grayscale images, need to repeat to 3 channels for ResNet
+    if args_.experiment in ["femnist", "mnist", "emnist"]:
+        # FEMNIST/EMNIST/MNIST: 28x28 grayscale images, need to repeat to 3 channels for ResNet
         all_data_tensor = all_data_tensor.view(-1, 1, 28, 28)
         # Pad to 32x32 and repeat to 3 channels
         x = F.pad(all_data_tensor, (2, 2, 2, 2))  # Pad from 28x28 to 32x32
