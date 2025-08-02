@@ -12,6 +12,7 @@ This file can also be imported as a module and contains the following function:
 import os.path
 
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 from utils.args import *
 from utils.utils import *
@@ -42,16 +43,32 @@ def init_clients(args_, root_path, logs_dir, save_path):
     all_data_tensor = []
     for cur_data in train_iterators:
         all_data_tensor.append(cur_data.dataset.data)
+    
+    # Handle empty data list case
+    if len(all_data_tensor) == 0:
+        print(f"Warning: No data found in {root_path}")
+        return []
+        
     all_data_tensor = torch.cat(all_data_tensor, dim=0)
 
     model = models.resnet18(pretrained=True)
 
     del model.fc
     print(all_data_tensor.shape)
-    all_data_tensor = all_data_tensor.view(-1, 3, 32, 32)
-    x = all_data_tensor
-    if all_data_tensor.shape[1] == 1:
-        x = all_data_tensor.repeat(1, 3, 1, 1)
+    
+    # Handle different dataset formats
+    if args_.experiment == "femnist":
+        # FEMNIST: 28x28 grayscale images, need to repeat to 3 channels for ResNet
+        all_data_tensor = all_data_tensor.view(-1, 1, 28, 28)
+        # Pad to 32x32 and repeat to 3 channels
+        x = F.pad(all_data_tensor, (2, 2, 2, 2))  # Pad from 28x28 to 32x32
+        x = x.repeat(1, 3, 1, 1)  # Repeat to 3 channels
+    else:
+        # CIFAR10/CIFAR100: 32x32 RGB images
+        all_data_tensor = all_data_tensor.view(-1, 3, 32, 32)
+        x = all_data_tensor
+        if all_data_tensor.shape[1] == 1:
+            x = all_data_tensor.repeat(1, 3, 1, 1)
     x = model.conv1(x.float())
     x = model.bn1(x)
     x = model.relu(x)
@@ -68,7 +85,10 @@ def init_clients(args_, root_path, logs_dir, save_path):
     global PCA_V
     PCA_V = V
     print(PCA_V.size())
-    with open(f"data/cifar10/all_data/PCA.pkl" , 'wb') as f:
+    # Create data directory if not exists
+    pca_dir = f"data/{args_.experiment}/all_data"
+    os.makedirs(pca_dir, exist_ok=True)
+    with open(f"{pca_dir}/PCA.pkl" , 'wb') as f:
         pickle.dump(PCA_V, f)
     # raise
 
@@ -152,6 +172,11 @@ def run_experiment(args_):
     test_clients = init_clients(args_, root_path=os.path.join(data_dir, "test"),
                                 logs_dir=os.path.join(logs_dir, "test"),
                                 save_path=os.path.join(save_dir, "test"))
+    
+    # Handle case where test_clients is empty
+    if not test_clients:
+        print("Warning: No test clients found, using training clients for testing")
+        test_clients = []
 
     logs_path = os.path.join(logs_dir, "train", "global")
     os.makedirs(logs_path, exist_ok=True)
